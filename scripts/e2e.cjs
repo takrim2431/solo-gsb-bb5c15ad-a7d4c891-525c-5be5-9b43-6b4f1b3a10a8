@@ -1521,6 +1521,357 @@ async function main() {
   // 已取消时段对任何人都不作为“有效清单”：演员看不到（参与者也不行）
   await G(`/api/rehearsals/${rhY}/schedules/${yTouch.id}/props`, zhou, 403);
 
+  console.log('— 临时替角：设置 / 替换 / 撤回与最终参与者、通知 —');
+  {
+    // 新剧 v1：场景 tS1 有 roleT(甲) 与 roleU(乙) 台词，场景 tS2 只有 roleT 台词
+    const pT = await J('/api/plays', director, { title: '替角测试剧' }, 201);
+    const tS1 = (await J(`/api/plays/${pT.id}/scenes`, director, { code: 'T1', title: '前场' }, 201)).id;
+    const tS2 = (await J(`/api/plays/${pT.id}/scenes`, director, { code: 'T2', title: '后场' }, 201)).id;
+    const roleT = (await J(`/api/plays/${pT.id}/roles`, director, { code: 'RT', name: '甲角' }, 201)).id;
+    const roleU = (await J(`/api/plays/${pT.id}/roles`, director, { code: 'RU', name: '乙角' }, 201)).id;
+    await J(`/api/plays/${pT.id}/lines`, director, { sceneId: tS1, roleId: roleT, text: '甲前场一句', seq: 1 }, 201);
+    await J(`/api/plays/${pT.id}/lines`, director, { sceneId: tS1, roleId: roleU, text: '乙前场一句', seq: 2 }, 201);
+    await J(`/api/plays/${pT.id}/lines`, director, { sceneId: tS2, roleId: roleT, text: '甲后场一句', seq: 1 }, 201);
+    const pvT1 = (await J(`/api/plays/${pT.id}/publish-initial`, director, { note: 'v1' }, 201)).version.id;
+    const rhT = (await J(`/api/plays/${pT.id}/rehearsals`, director, { versionId: pvT1, name: '替角排练' }, 201)).id;
+    await J(`/api/rehearsals/${rhT}/cast`, director, { roleId: roleT, actorId: linId }, 201);
+    await J(`/api/rehearsals/${rhT}/cast`, director, { roleId: roleU, actorId: chenId }, 201);
+    // 周海在 2040-06-01 下午已有另一段“占用”时段（用 roleT 不可能，改用另一排练派周海），冲突用例另建
+    const sA = (await J(`/api/rehearsals/${rhT}/schedules`, director, {
+      sceneId: tS1, startAt: '2040-06-01T10:00:00+08:00', endAt: '2040-06-01T11:00:00+08:00',
+    }, 201)).schedule;
+    const sB = (await J(`/api/rehearsals/${rhT}/schedules`, director, {
+      sceneId: tS2, startAt: '2040-06-02T10:00:00+08:00', endAt: '2040-06-02T11:00:00+08:00',
+    }, 201)).schedule;
+
+    // 入参拒绝：演员不能操作；无效时段/角色/非演员/替补=原演员/缺原因
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, lin,
+      { substituteActorId: zhouId, reason: '病假' }, 403);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/999999/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '病假' }, 400);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/999999`, director,
+      { substituteActorId: zhouId, reason: '病假' }, 400);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: director, reason: '病假' }, 400);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: linId, reason: '不能是本人' }, 400);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId }, 400);
+    check('替角设置：演员 403；无效时段/角色/导演身份/本人替补/缺原因 400', true);
+
+    // 周海设置为 sA 甲角替角
+    const setR = await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '林晚嗓子不适' }, 200);
+    check('设置替角成功', setR.ok && setR.substitute.status === 'active'
+      && setR.substitute.substituteActorId === zhouId && setR.substitute.originalActorId === linId,
+      JSON.stringify(setR));
+    check('返回最终参与者：周海顶替甲角（temporary 标记），林晚仍以乙?——核对原演员退出',
+      setR.participants.some((p) => p.actorId === zhouId && p.roles.some((x) => x.roleId === roleT && x.temporary))
+      && !setR.participants.some((p) => p.actorId === linId)
+      && setR.participants.some((p) => p.actorId === chenId), JSON.stringify(setR.participants));
+
+    // 列表：导演视图含 substitutes 与最终参与者；演员列表中周海能看到该时段而林晚看不到 sA
+    const dirList = await G(`/api/rehearsals/${rhT}/schedules`, director);
+    const sAView = dirList.schedules.find((s) => s.id === sA.id);
+    check('导演日程列表含生效替角与最终参与者',
+      sAView.substitutes.length === 1 && sAView.substitutes[0].substituteActorId === zhouId
+      && !sAView.participants.some((p) => p.actorId === linId)
+      && sAView.participants.some((p) => p.actorId === zhouId));
+    const zhouList = await G(`/api/rehearsals/${rhT}/schedules`, zhou);
+    check('替补演员（非常驻派角）可见该时段且 myRoles 标 temporary',
+      zhouList.schedules.some((s) => s.id === sA.id
+        && s.myRoles.some((x) => x.roleId === roleT && x.temporary)),
+      JSON.stringify(zhouList.schedules));
+    const linList = await G(`/api/rehearsals/${rhT}/schedules`, lin);
+    check('被替原演员在该时段退出（林晚不见 sA，但仍见 sB）',
+      !linList.schedules.some((s) => s.id === sA.id)
+      && linList.schedules.some((s) => s.id === sB.id));
+
+    // 通知：设置后 sA 产生新批次，接收人为周海+陈默；林晚不在；周海可见可确认
+    const sANotif = await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/notifications`, director);
+    check('替角重发通知批次', sANotif.current.seq === 2
+      && sANotif.current.recipients.some((x) => x.actorId === zhouId)
+      && sANotif.current.recipients.some((x) => x.actorId === chenId)
+      && !sANotif.current.recipients.some((x) => x.actorId === linId)
+      && sANotif.current.recipients.find((x) => x.actorId === zhouId).roles[0].temporary === true,
+      JSON.stringify(sANotif.current && sANotif.current.recipients));
+    const zhouNotifs = await G('/api/me/schedule-notifications', zhou);
+    check('替补演员收到本人通知批次', zhouNotifs.notifications.some((n) => n.scheduleId === sA.id && n.myState === 'pending'));
+    const zhouConfirmId = zhouNotifs.notifications.find((n) => n.scheduleId === sA.id).id;
+    await J(`/api/schedule-notifications/${zhouConfirmId}/confirm`, zhou, {}, 201);
+    // 无实质变化（同值/仅改原因）不重发：把周海再设一次仅改原因 -> seq 不变
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '林晚改期复诊' }, 200);
+    const sANotif2 = await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/notifications`, director);
+    check('仅改原因不重发通知（旧批次保留历史）', sANotif2.current.seq === 2 && sANotif2.history.length === 1);
+
+    // 替角台词：周海只能看到 sA 本场甲角台词（temporary），看不到 sB/乙角；林晚 sA 无份
+    const zhouTemp = await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/temp-lines`, zhou);
+    check('替角可见本场本人角色台词并标 temporary',
+      zhouTemp.lines.length === 1 && zhouTemp.lines[0].text === '甲前场一句'
+      && zhouTemp.lines[0].temporary === true && zhouTemp.sceneId === tS1,
+      JSON.stringify(zhouTemp));
+    await G(`/api/rehearsals/${rhT}/schedules/${sB.id}/temp-lines`, zhou, 403);
+    await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/temp-lines`, lin, 403);
+    // 临时台词权限不外延：周海不能打开排练稿、不能逐场确认
+    await G(`/api/rehearsals/${rhT}/script`, zhou, 403);
+    await J(`/api/rehearsals/${rhT}/confirm`, zhou, { roleId: roleT, sceneId: tS1 }, 403);
+    check('临时台词权限不扩展到其他场次/排练稿/逐场确认', true);
+    // 常驻派角与逐场确认不受替角影响：林晚仍可在排练详情/排练稿中看到甲角
+    const linScript = await G(`/api/rehearsals/${rhT}/script`, lin);
+    check('常驻派角不变：林晚排练稿仍是完整甲角台词（含前场后场）',
+      linScript.lines.filter((l) => l.roleId === roleT).length === 2);
+
+    // 替换：改为陈默替甲角（陈默本就演乙角）-> 最终参与者合并为 1 人 2 角；通知接收人变化重发
+    const repR = await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director,
+      { substituteActorId: chenId, reason: '周海也来不了' }, 200);
+    check('替换替角：陈默一人承担甲乙两角（合并），林晚/周海均退出',
+      repR.participants.length === 1 && repR.participants[0].actorId === chenId
+      && repR.participants[0].roles.length === 2
+      && repR.participants[0].roles.some((x) => x.roleId === roleT && x.temporary)
+      && repR.participants[0].roles.some((x) => x.roleId === roleU && !x.temporary),
+      JSON.stringify(repR.participants));
+    // 同一角色同一时段只保留一个生效替角：旧替角失效入历史
+    const hist = await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes`, director);
+    check('同角色同时段只有一个生效替角，旧批次/旧替角留历史',
+      hist.active.length === 1 && hist.active[0].substituteActorId === chenId
+      && hist.history.length === 1 && hist.history[0].status === 'invalidated');
+
+    // 冲突：为周海另建排练+时段（2040-06-03 10:00–11:00），再把 sB（同时段日期不同，改到同时间）替角
+    const rhZ = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '替角冲突排练' }, 201)).id;
+    await J(`/api/rehearsals/${rhZ}/cast`, director, { roleId: roleA, actorId: zhouId }, 201);
+    const zSlot = (await J(`/api/rehearsals/${rhZ}/schedules`, director, {
+      sceneId: sc1, startAt: '2040-06-03T10:00:00+08:00', endAt: '2040-06-03T11:00:00+08:00',
+    }, 201)).schedule;
+    // 把 sB 调整到与 zSlot 完全重叠，再尝试替角为周海 -> 409 SCHEDULE_CONFLICT 整体不生效
+    await req('PATCH', `/api/rehearsals/${rhT}/schedules/${sB.id}`, director,
+      { startAt: '2040-06-03T10:00:00+08:00', endAt: '2040-06-03T11:00:00+08:00' }, 200);
+    const clash = await req('PUT', `/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '试冲突' }, 409);
+    check('替角与其他有效时段重叠 -> 409 SCHEDULE_CONFLICT 且整体不生效',
+      clash.error === 'SCHEDULE_CONFLICT' && clash.details.conflicts.length >= 1
+      && clash.details.conflicts.some((c) => c.actorId === zhouId
+        && (c.schedule.id === sB.id || c.overlapsWith.id === sB.id)
+        && (c.overlapsWith.id === zSlot.id || c.schedule.id === zSlot.id)),
+      JSON.stringify(clash));
+    const bList = (await G(`/api/rehearsals/${rhT}/schedules`, director)).schedules.find((s) => s.id === sB.id);
+    check('冲突后替角未生效：sB 参与者仍是林晚',
+      bList.participants.some((p) => p.actorId === linId) && !bList.participants.some((p) => p.actorId === zhouId));
+
+    // 端点相接允许：把替角时段调整为 09:00–10:00（与 zSlot 10:00–11:00 相接）-> 替角可设置
+    await req('PATCH', `/api/rehearsals/${rhT}/schedules/${sB.id}`, director,
+      { startAt: '2040-06-03T09:00:00+08:00', endAt: '2040-06-03T10:00:00+08:00' }, 200);
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '相接不冲突' }, 200);
+    check('端点相接：替角设置成功', true);
+
+    // 不可用时段冲突：周海登记覆盖 sB（09:30–09:45 在 09:00–10:00 内）的不可用 -> 登记 409
+    const unav = await J('/api/me/unavailability', zhou, {
+      startAt: '2040-06-03T09:30:00+08:00', endAt: '2040-06-03T09:45:00+08:00', reason: '体检',
+    }, 409);
+    check('替补演员登记覆盖其替角时段的不可用 -> 409（最终参与者口径）',
+      unav.error === 'UNAVAILABILITY_CONFLICT'
+      && unav.details.conflicts.some((c) => c.actorId === zhouId && c.schedule.id === sB.id),
+      JSON.stringify(unav));
+
+    // 撤回替角：先恢复 sB 到无不可用冲突状态（撤不可用不需要，因登记被拒没建成）
+    const wd = await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 200);
+    check('撤回替角成功，最终参与者恢复林晚',
+      wd.action === 'withdrawn' && wd.participants.some((p) => p.actorId === linId)
+      && !wd.participants.some((p) => p.actorId === zhouId));
+    await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 400);
+    check('重复撤回 400', true);
+
+    // 撤回时冲突：sB（林晚是原演员）被替成周海期间，给林晚另建一段重叠时段；
+    // 该时段与 sB 时间重叠，但此时林晚已退出 sB，故创建成功
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '撤回冲突用' }, 200);
+    const linClashSlot = (await J(`/api/rehearsals/${rhA}/schedules`, director, {
+      sceneId: sc1, startAt: '2040-06-03T09:30:00+08:00', endAt: '2040-06-03T10:30:00+08:00',
+    }, 201)).schedule;
+    const wdClash = await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 409);
+    check('撤回后原演员撞其他有效时段 -> 409 撤回整体不生效',
+      wdClash.error === 'SCHEDULE_CONFLICT'
+      && wdClash.details.conflicts.some((c) => c.actorId === linId
+        && (c.overlapsWith.id === linClashSlot.id || c.schedule.id === linClashSlot.id)),
+      JSON.stringify(wdClash));
+    const stillSub = (await G(`/api/rehearsals/${rhT}/schedules`, director)).schedules.find((s) => s.id === sB.id);
+    check('撤回失败后替角仍生效（周海仍在、林晚仍退出）',
+      stillSub.participants.some((p) => p.actorId === zhouId) && !stillSub.participants.some((p) => p.actorId === linId));
+    // 清理：取消林晚冲突时段后撤回成功
+    await J(`/api/rehearsals/${rhA}/schedules/${linClashSlot.id}/cancel`, director, {}, 200);
+    await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 200);
+
+    // 撤回时不可用冲突：替成周海后，林晚登记覆盖 sB 的不可用（此时林晚非参与者，允许登记）
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director,
+      { substituteActorId: zhouId, reason: '撤回不可用冲突用' }, 200);
+    const linU = await J('/api/me/unavailability', lin, {
+      startAt: '2040-06-03T09:30:00+08:00', endAt: '2040-06-03T09:45:00+08:00', reason: '林晚临时有事',
+    }, 201);
+    const wdUnavail = await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 409);
+    check('撤回后原演员撞本人不可用时段 -> 409 UNAVAILABILITY_CONFLICT 撤回整体不生效',
+      wdUnavail.error === 'UNAVAILABILITY_CONFLICT'
+      && wdUnavail.details.conflicts.some((c) => c.actorId === linId && c.schedule.id === sB.id),
+      JSON.stringify(wdUnavail));
+    // 撤销不可用后撤回成功
+    await D(`/api/me/unavailability/${linU.unavailability.id}`, lin, 200);
+    await D(`/api/rehearsals/${rhT}/schedules/${sB.id}/substitutes/${roleT}`, director, 200);
+
+    // 调期到“角色无台词但场次仍有其他角色台词”的场次：该角色替角 role_no_lines 失效，时段仍有效
+    await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleU}`, director,
+      { substituteActorId: zhouId, reason: '乙角也替' }, 200);
+    await req('PATCH', `/api/rehearsals/${rhT}/schedules/${sA.id}`, director,
+      { sceneId: tS2, startAt: '2040-06-01T10:00:00+08:00', endAt: '2040-06-01T11:00:00+08:00' }, 200);
+    let sAMoved = (await G(`/api/rehearsals/${rhT}/schedules`, director)).schedules.find((s) => s.id === sA.id);
+    check('调期到乙角无台词场次：乙角替角失效（role_no_lines），甲角替角保留，时段仍有效',
+      sAMoved.status === 'active' && sAMoved.substitutes.length === 1
+      && sAMoved.substitutes[0].roleId === roleT
+      && sAMoved.participants.some((p) => p.actorId === chenId)
+      && !sAMoved.participants.some((p) => p.actorId === zhouId),
+      JSON.stringify(sAMoved.substitutes));
+    // 调回 tS1：失效替角不会自动复活
+    await req('PATCH', `/api/rehearsals/${rhT}/schedules/${sA.id}`, director,
+      { sceneId: tS1, startAt: '2040-06-01T10:00:00+08:00', endAt: '2040-06-01T11:00:00+08:00' }, 200);
+    sAMoved = (await G(`/api/rehearsals/${rhT}/schedules`, director)).schedules.find((s) => s.id === sA.id);
+    check('调回后失效替角不复活（陈默仍以甲乙两角在最终名单）',
+      sAMoved.substitutes.length === 1 && sAMoved.substitutes[0].roleId === roleT
+      && sAMoved.participants.length === 1 && sAMoved.participants[0].actorId === chenId
+      && sAMoved.participants[0].roles.length === 2);
+
+    // 已开启签到的时段冻结：不能设/撤替角
+    await J(`/api/rehearsals/${rhT}/schedules/${sA.id}/attendance`, director, {}, 201);
+    const frozen = await req('PUT', `/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleU}`, director,
+      { substituteActorId: zhouId, reason: '签到后' }, 409);
+    check('签到开启后冻结：设置 409 ATTENDANCE_FROZEN', frozen.error === 'ATTENDANCE_FROZEN', JSON.stringify(frozen));
+    const frozenDel = await D(`/api/rehearsals/${rhT}/schedules/${sA.id}/substitutes/${roleT}`, director, 409);
+    check('签到开启后冻结：撤回生效替角 409 ATTENDANCE_FROZEN；名单不回写（陈默一人两角在冻结名单）',
+      frozenDel.error === 'ATTENDANCE_FROZEN',
+      JSON.stringify(frozenDel));
+    const frozenRoster = (await G(`/api/rehearsals/${rhT}/schedules/${sA.id}/attendance`, director)).session.roster;
+    check('冻结名单不回写（陈默一人两角在冻结名单）',
+      frozenRoster.length === 1 && frozenRoster[0].actorId === chenId
+      && frozenRoster[0].roles.length === 2,
+      JSON.stringify(frozenRoster.map((x) => ({ a: x.actorId, r: x.roles.map((y) => y.roleId) }))));
+  }
+
+  console.log('— 临时替角：改派 / 调期 / 取消 / 换版后失效并重校验 —');
+  {
+    const pV = await J('/api/plays', director, { title: '替角失效剧' }, 201);
+    const vS1 = (await J(`/api/plays/${pV.id}/scenes`, director, { code: 'V1', title: '一场' }, 201)).id;
+    const vS2 = (await J(`/api/plays/${pV.id}/scenes`, director, { code: 'V2', title: '二场' }, 201)).id;
+    const roleV = (await J(`/api/plays/${pV.id}/roles`, director, { code: 'RV', name: '主角' }, 201)).id;
+    await J(`/api/plays/${pV.id}/lines`, director, { sceneId: vS1, roleId: roleV, text: '一场台词', seq: 1 }, 201);
+    await J(`/api/plays/${pV.id}/lines`, director, { sceneId: vS2, roleId: roleV, text: '二场台词', seq: 1 }, 201);
+    const pvV1 = (await J(`/api/plays/${pV.id}/publish-initial`, director, {}, 201)).version.id;
+    // v2：清空 vS2 台词
+    const vd = await G(`/api/plays/${pV.id}`, director);
+    const rev = await J(`/api/plays/${pV.id}/revisions`, director, { title: '删二场' }, 201);
+    await J(`/api/revisions/${rev.id}/items`, director, {
+      action: 'delete', lineId: vd.lines.find((l) => l.text === '二场台词').id, oldText: '二场台词',
+    }, 201);
+    const pvV2 = (await J(`/api/plays/${pV.id}/publish`, director, { revisionIds: [rev.id] }, 201)).newVersion.id;
+
+    const rhV = (await J(`/api/plays/${pV.id}/rehearsals`, director, { versionId: pvV1, name: '失效排练' }, 201)).id;
+    await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleV, actorId: linId }, 201);
+    const vA = (await J(`/api/rehearsals/${rhV}/schedules`, director, {
+      sceneId: vS1, startAt: '2041-06-01T10:00:00+08:00', endAt: '2041-06-01T11:00:00+08:00',
+    }, 201)).schedule;
+    const vB = (await J(`/api/rehearsals/${rhV}/schedules`, director, {
+      sceneId: vS2, startAt: '2041-06-02T10:00:00+08:00', endAt: '2041-06-02T11:00:00+08:00',
+    }, 201)).schedule;
+    // vC 原排 vS1 后调期挪到 vS2：v1 中 vS2 有台词所以调期成功；换版后随场次一起转待调整
+    const vC = (await J(`/api/rehearsals/${rhV}/schedules`, director, {
+      sceneId: vS1, startAt: '2041-06-03T10:00:00+08:00', endAt: '2041-06-03T11:00:00+08:00',
+    }, 201)).schedule;
+    await req('PATCH', `/api/rehearsals/${rhV}/schedules/${vC.id}`, director,
+      { sceneId: vS2, startAt: '2041-06-03T10:00:00+08:00', endAt: '2041-06-03T11:00:00+08:00' }, 200);
+
+    // 先改派（林晚 -> 陈默）：此时还没有替角，失效列表为空
+    const reCast = await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleV, actorId: chenId }, 200);
+    check('改派接口返回替角失效列表（本次无替角为空数组）',
+      reCast.ok && Array.isArray(reCast.substitutesInvalidated) && reCast.substitutesInvalidated.length === 0,
+      JSON.stringify(reCast));
+    // 改派后设置三个时段替角（原演员均为陈默）
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vA.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '替一场' }, 200);
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vB.id}/substitutes/${roleV}`, director,
+      { substituteActorId: linId, reason: '替二场' }, 200);
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vC.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '替三' }, 200);
+    // 再把主角改派回林晚：三个生效替角全部失效（原派角变化），周海退出 vA/vC
+    const reCast2 = await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleV, actorId: linId }, 200);
+    check('改派后相关时段替角失效', reCast2.substitutesInvalidated.length === 3, JSON.stringify(reCast2));
+    const vAView = (await G(`/api/rehearsals/${rhV}/schedules`, director)).schedules.find((s) => s.id === vA.id);
+    check('失效后按最终名单：周海退出，林晚（新派角）进入',
+      vAView.substitutes.length === 0 && !vAView.participants.some((p) => p.actorId === zhouId)
+      && vAView.participants.some((p) => p.actorId === linId));
+    const hA = await G(`/api/rehearsals/${rhV}/schedules/${vA.id}/substitutes`, director);
+    check('失效替角保留历史（cast_changed）',
+      hA.history.some((x) => x.invalidatedReason === 'cast_changed' && x.substituteActorId === zhouId));
+
+    // 重新设置替角：vA（vS1，换版后仍有台词 -> 存活）；vB/vC（vS2 -> 整场无台词转待调整，替角失效）
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vA.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '重新校验后再设' }, 200);
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vB.id}/substitutes/${roleV}`, director,
+      { substituteActorId: chenId, reason: '二场重设' }, 200);
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vC.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '三场重设' }, 200);
+
+    // 换版 v1 -> v2：vB/vC（排 vS2 整场无台词）转待调整，替角 schedule_pending_adjustment 失效；
+    // vA（vS1 仍有台词、原派角未变）替角存活，周海继续参与
+    const prevV = await J(`/api/rehearsals/${rhV}/switch-version/preview`, director, { versionId: pvV2 }, 200);
+    check('预演列出替角失效与待调整时段',
+      prevV.substitutesInvalidated.some((x) => x.scheduleId === vB.id && x.reason === 'schedule_pending_adjustment')
+      && prevV.substitutesInvalidated.some((x) => x.scheduleId === vC.id && x.reason === 'schedule_pending_adjustment')
+      && prevV.needsAdjustmentSchedules.includes(vB.id)
+      && prevV.needsAdjustmentSchedules.includes(vC.id)
+      && !prevV.substitutesInvalidated.some((x) => x.scheduleId === vA.id)
+      && prevV.schedules.find((x) => x.id === vA.id).participantsAfter.some((p) => p.actorId === zhouId),
+      JSON.stringify(prevV.substitutesInvalidated));
+    const commitV = await J(`/api/rehearsals/${rhV}/switch-version/commit`, director,
+      { versionId: pvV2, previewToken: prevV.previewToken }, 200);
+    check('换版成功且返回失效替角',
+      commitV.substitutesInvalidated.length === 2
+      && commitV.needsAdjustmentSchedules.includes(vB.id)
+      && commitV.needsAdjustmentSchedules.includes(vC.id),
+      JSON.stringify({ si: commitV.substitutesInvalidated, na: commitV.needsAdjustmentSchedules }));
+    // 存活替角：vA 周海仍在最终参与者
+    const vAAfter = (await G(`/api/rehearsals/${rhV}/schedules`, director)).schedules.find((s) => s.id === vA.id);
+    check('未失效替角继续生效：vA 周海仍参与（临时台词权限仍仅限该时段）',
+      vAAfter.substitutes.length === 1 && vAAfter.substitutes[0].substituteActorId === zhouId
+      && vAAfter.participants.some((p) => p.actorId === zhouId));
+    const afterB = await G(`/api/rehearsals/${rhV}/schedules/${vB.id}/substitutes`, director);
+    check('待调整时段替角失效（不占用演员）且历史可见',
+      afterB.active.length === 0 && afterB.history.some((x) => x.invalidatedReason === 'schedule_pending_adjustment'));
+    // 待调整期间不占用：周海可登记与 vC（已待调整）重叠的不可用
+    await J('/api/me/unavailability', zhou, {
+      startAt: '2041-06-03T10:30:00+08:00', endAt: '2041-06-03T10:45:00+08:00', reason: '待调整不占用',
+    }, 201);
+    // 待调整时段不能设替角；把 vB 调整回有台词的 vS1 恢复有效后，须重新设置替角
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vB.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '待调整期拒绝' }, 400);
+    await req('PATCH', `/api/rehearsals/${rhV}/schedules/${vB.id}`, director,
+      { sceneId: vS1, startAt: '2041-06-02T10:00:00+08:00', endAt: '2041-06-02T11:00:00+08:00' }, 200);
+    const restored = (await G(`/api/rehearsals/${rhV}/schedules`, director)).schedules.find((s) => s.id === vB.id);
+    check('恢复有效后须重新设置替角（不会自动复活）',
+      restored.status === 'active' && restored.substitutes.length === 0
+      && restored.participants.some((p) => p.actorId === linId)
+      && !restored.participants.some((p) => p.actorId === chenId));
+
+    // 取消时段：生效替角失效，取消期间不占用、不能设置
+    const vD = (await J(`/api/rehearsals/${rhV}/schedules`, director, {
+      sceneId: vS1, startAt: '2041-06-04T10:00:00+08:00', endAt: '2041-06-04T11:00:00+08:00',
+    }, 201)).schedule;
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vD.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '取消用' }, 200);
+    await J(`/api/rehearsals/${rhV}/schedules/${vD.id}/cancel`, director, {}, 200);
+    const hC = await G(`/api/rehearsals/${rhV}/schedules/${vD.id}/substitutes`, director);
+    check('取消时段替角失效（schedule_cancelled）',
+      hC.active.length === 0 && hC.history.some((x) => x.invalidatedReason === 'schedule_cancelled'));
+    await req('PUT', `/api/rehearsals/${rhV}/schedules/${vD.id}/substitutes/${roleV}`, director,
+      { substituteActorId: zhouId, reason: '已取消' }, 400);
+  }
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

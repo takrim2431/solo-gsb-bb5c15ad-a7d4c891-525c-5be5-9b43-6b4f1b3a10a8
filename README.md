@@ -135,6 +135,33 @@
 5. 批次与源操作**同一事务**提交：排期/不可用冲突导致源操作失败时**不会留下批次**；
    已开启的**到场登记名单**与台词**逐场确认**不受通知影响。
 
+### 单时段临时替角（排练页，签到开启前）
+
+1. 导演可为**有效（active）**时段在**签到开启前**设置**临时替角**
+   （`PUT /api/rehearsals/:id/schedules/:sid/substitutes/:roleId`）：选择**本场有台词且已派角**
+   的角色、**不同于原演员**的替补演员（必须是演员身份）与**原因**；同一演员兼任多角时合并为一个参与者。
+   **无效时段**（不存在/不属于该排练/已取消/待调整）、**无效角色**（不存在/不属于该剧/本场无台词/未派角）、
+   **非演员身份**、替补即原演员或缺少原因一律 `400/404` 明确拒绝；演员调用 `403`。
+2. **同一角色同一时段只保留一个生效替角**：再次设置为**替换**（旧行失效留历史）；
+   导演可**撤回**（`DELETE`，重复撤回 `400`）。响应返回该时段的**最终参与者**及替角状态。
+3. 替角**只改变该时段**的最终参与者、**通知接收人**与**替角可见的本场台词**：
+   **不改变常驻派角**（`rehearsal_cast`）与**逐场确认**（`confirmations`）；
+   临时台词权限**不得扩展至其他场次/时段**（演员经 `GET .../temp-lines` 只看本时段本场本人角色台词，
+   无常驻派角时排练稿/逐场确认仍 `403`）。
+4. **设置和撤回**都按**最终参与者**检查与**其他有效时段**的重叠及替补/原演员**本人不可用时段**：
+   `409 SCHEDULE_CONFLICT` / `UNAVAILABILITY_CONFLICT`（`details.conflicts` 同现有结构），
+   **端点相接允许**，冲突时**整体不生效**；已取消与待调整时段不参与。
+5. **调期、批量调期、换版或改派**后，若替补角色**失去台词**或**原派角变化**（含撤派），替角**失效**
+   （`role_no_lines` / `cast_changed` / `cast_unassigned`）并按**最终名单重新校验**冲突；
+   时段**取消或待调整**时替角失效、**不占用演员**，**恢复有效须重新设置**（不自动复活）。
+   换版预演/提交响应中列出将失效的替角。
+6. 替角使**通知接收人或其角色**（含常驻/临时身份）变化时才**重发通知批次**，
+   旧批次保留为历史；无实质变化（如同值设置、仅改原因）不重发。
+   **已开启签到的时段名单冻结**：不再允许设置/撤回替角（`409 ATTENDANCE_FROZEN`），冻结名单不回写。
+7. 可见性：导演日程列表含 `substitutes` 与替角后的最终参与者，并有
+   `GET .../substitutes` 查看生效与失效历史；演员（含仅有替角身份者）只看到自己作为最终参与者的有效时段，
+   其角色条目标有 `temporary: true` 与 `originalActorId`。
+
 ### 剧团共享道具（按排练时段预约）
 
 1. 导演**登记**各共享道具的**非负整数总件数**（库存），道具名不可重复；可随时**调整总量**（可选改名）。
@@ -237,7 +264,9 @@ PORT=8080 docker compose up --build -d
   日程继续有效或转待调整、参与演员与通知接收人变化及冲突，再凭预演令牌一键提交；预演后相关状态变化会提示重新预演）、
   派角/改派（亦可**批量派角调整**：勾选至少两个角色并选定目标演员或撤派，整批按最终派角校验，
   任一冲突整批不生效，成功后提示变更条数与重发通知的时段数），查看待确认清单与冲突；
-  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；勾选至少两条未取消时段可**批量调整**
+  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；在签到开启前为单场有台词且已派角的角色
+  **设置/撤回临时替角**（选择不同的替补演员与原因；返回替角后的最终参与者；设置/撤回按最终名单做
+  时段与本人不可用重叠校验，冲突整体不生效；改派/调期/换版后失效并重校验，恢复有效须重设）；勾选至少两条未取消时段可**批量调整**
   （整批校验冲突，成功后提示有实质变化并重发通知的条数，未变化不重发）；对有效时段**开启/查看/关闭到场登记**
   （名单、缺口、应到/签到/缺席统计）；在“知悉通知”列查看各时段**当前批次的已确认/待确认名单与
   历史批次**。排期/调期/派角/换版若撞上演员不可用时段，页面会提示冲突演员及其不可用时段与原因。
@@ -281,6 +310,9 @@ PORT=8080 docker compose up --build -d
 | PATCH | `/api/rehearsals/:id/schedules/:sid` | 调整时段/场次（导演；待调整的时段借此恢复有效） |
 | POST | `/api/rehearsals/:id/schedules/batch-adjust` | 批量调整（导演）：一次提交同一排练至少两条未取消时段的目标场次与带时区起止；按整批最终状态统一冲突检测，任一冲突整批不生效；仅实质变化时段重发通知 |
 | POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查；联动到场登记见下） |
+| PUT/DELETE | `/api/rehearsals/:id/schedules/:sid/substitutes/:roleId` | 设置/替换 / 撤回单时段临时替角（导演，签到开启前）：按最终参与者校验重叠与不可用，冲突整体不生效 |
+| GET | `/api/rehearsals/:id/schedules/:sid/substitutes` | 该时段替角（导演）：生效替角 + 失效历史 |
+| GET | `/api/rehearsals/:id/schedules/:sid/temp-lines` | 演员查看自己作为最终参与者在该时段本场可见台词（含临时替角角色；权限仅限本时段本场） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance` | 开启到场登记（导演；冻结名单/缺口/版本/UTC 时段，每时段至多一次） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/check-in` | 演员本人签到（开放期+名单内；重试返回首次结果） |
@@ -299,7 +331,7 @@ PORT=8080 docker compose up --build -d
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`、`NOTIFICATION_EXPIRED`、`PREVIEW_STALE`、`PROP_CAPACITY_CONFLICT`、`ATTENDANCE_FROZEN`）。
 
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
@@ -762,6 +794,87 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/2/props \
 #        "props":[{"propId":1,"propName":"煤油灯","quantity":2}]}
 ```
 
+## 临时替角接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token（演员 zhou / actor123 将作为替补）
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 为有效时段 1 的角色 1（本场有台词、原派给林晚）设置临时替角周海
+curl -s -X PUT http://localhost:3000/api/rehearsals/1/schedules/1/substitutes/1 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"substituteActorId":4,"reason":"林晚嗓子不适"}'
+# -> 200 {"ok":true,"action":"set",
+#        "substitute":{"id":1,"roleId":1,"roleName":"守塔人",
+#          "originalActorId":2,"originalActorName":"林晚",
+#          "substituteActorId":4,"substituteActorName":"周海",
+#          "reason":"林晚嗓子不适","status":"active","invalidatedReason":null,...},
+#        "participants":[{"actorId":4,"actorName":"周海",
+#          "roles":[{"roleId":1,"roleName":"守塔人","temporary":true,
+#                    "originalActorId":2,"originalActorName":"林晚"}]}, ...],
+#        "schedule":{...}}
+#    - participants 为替角后的“最终参与者”：原演员退出该角色，替补进入；一人多角合并。
+#    - 再次 PUT（同角色不同替补）= 替换，旧替角失效留历史；
+#      同替补再次 PUT 仅更新原因，不重发通知。
+
+# 3. 拒绝示例（全部在写入前明确拒绝，不留任何数据）：
+#    非导演 403；无效时段/角色 400；本场无台词或未派角 400；
+#    替补不是演员 400；替补即原演员 400；缺 reason 400；
+#    已取消/待调整时段 400；已开启签到的时段 409 ATTENDANCE_FROZEN。
+curl -s -X PUT http://localhost:3000/api/rehearsals/1/schedules/1/substitutes/1 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"substituteActorId":2,"reason":"不能替本人"}'
+# -> 400 {"error":"BAD_REQUEST","message":"替补演员必须不同于该角色的原演员"}
+
+# 4. 设置后最终参与者与其他有效时段重叠 / 替补撞本人不可用 -> 409，整体不生效
+# -> 409 {"error":"SCHEDULE_CONFLICT",
+#        "message":"设置临时替角后最终参与者与其他有效时段重叠，本次设置未生效",
+#        "details":{"conflicts":[{"actorId":4,"actorName":"周海",
+#          "schedule":{"id":1,...},"overlapsWith":{"id":8,"rehearsalId":3,...}}]}}
+#    不可用冲突：409 UNAVAILABILITY_CONFLICT（conflicts 含 unavailability:{id,startAt,endAt,reason}）；
+#    端点相接（end==start）不算冲突。
+
+# 5. 撤回替角（按撤回后的最终参与者——原演员回来——重查冲突；冲突则撤回不生效）
+curl -s -X DELETE http://localhost:3000/api/rehearsals/1/schedules/1/substitutes/1 \
+  -H "Authorization: Bearer <TOKEN>"
+# -> 200 {"ok":true,"action":"withdrawn","roleId":1,"participants":[...原演员回来...]}
+#    原演员此时与其他有效时段重叠/撞本人不可用 -> 409 且替角仍生效；重复撤回 400。
+
+# 6. 导演查看替角（生效 + 失效历史）
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/substitutes \
+  -H "Authorization: Bearer <TOKEN>"
+# -> {"scheduleId":1,"active":[{"id":2,...,"status":"active"}],
+#     "history":[{"id":1,"status":"invalidated","invalidatedReason":"withdrawn",...},
+#                {"id":3,"invalidatedReason":"cast_changed",...},
+#                {"id":4,"invalidatedReason":"role_no_lines",...},
+#                {"id":5,"invalidatedReason":"schedule_cancelled",...}]}
+#    失效原因：withdrawn / cast_changed / cast_unassigned / role_no_lines /
+#             schedule_cancelled / schedule_pending_adjustment。
+
+# 7. 通知：仅当接收人或其角色（含常驻/临时身份）变化才重发批次；旧批次保留为历史
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/notifications \
+  -H "Authorization: Bearer <TOKEN>"
+# -> {"current":{"seq":2,"recipients":[{"actorId":4,"actorName":"周海",
+#        "roles":[{"roleId":1,"temporary":true,...}],"state":"pending"}, ...]},
+#     "history":[{"seq":1,"status":"superseded",...}]}
+
+# 8. 替补演员（周海，非常驻派角）：可见该时段，确认通知，并只看本场替角台词
+curl -s http://localhost:3000/api/rehearsals/1/schedules \
+  -H "Authorization: Bearer <ZHOU_TOKEN>"
+# -> {"schedules":[{"id":1,"myRoles":[{"roleId":1,"roleName":"守塔人",
+#                       "temporary":true,"originalActorId":2,...}], ...}]}
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/temp-lines \
+  -H "Authorization: Bearer <ZHOU_TOKEN>"
+# -> {"scheduleId":1,"sceneId":1,"myRoles":[...],
+#     "lines":[{"lineId":1,"roleId":1,"temporary":true,"text":"今晚的浪比昨天高，..."}]}
+#    - 其他时段/场次的 temp-lines 403；排练稿 /script 与逐场确认 /confirm 仍 403（权限不外延）。
+#    - 调期/批量调期/换版/改派使角色失去台词或原派角变化 -> 替角失效并按最终名单重校验；
+#      取消或待调整期间不占用演员，恢复有效后须重新设置（换版预演响应含 substitutesInvalidated）。
+```
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
@@ -782,7 +895,11 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules/2/props \
 冲突失败不留批次、不影响签到名单与逐场确认）、
 共享道具（登记/改名/调总量与下调校验、单条与跨排练批量预约、无效件数/未知道具时段/同批重复组合拒绝、
 半开区间与端点相接、撤销(0)与未列出项不变、整批最终状态校验与回滚、调期与批量调期携带预约移动超占整体不生效、
-取消/转待调整释放占用、恢复有效重新校验、演员仅见本人参与有效时段清单且越权 403、日程列表 props 简表）等：
+取消/转待调整释放占用、恢复有效重新校验、演员仅见本人参与有效时段清单且越权 403、日程列表 props 简表）、
+临时替角（设置/替换/撤回与最终参与者返回；无效时段/角色/非演员/本人替补/缺原因拒绝；同角色同时段一个替角；
+只改本时段参与者/通知接收人/替角本场台词而不改常驻派角与逐场确认、权限不外延；
+设置/撤回按最终名单检查时段与本人不可用重叠、端点相接、冲突整体不生效；改派/调期/取消/换版后失去台词或原派角变化即失效并重校验、
+取消待调整不占用、恢复有效重新设置；接收人或角色变化才重发通知、旧批次留历史；签到开启后冻结不回写）等：
 
 ```bash
 npm test
@@ -808,6 +925,8 @@ src/
   notifications.js 时段通知（知悉确认）：导演查看批次名单与历史、演员本人批次列表与幂等确认
   props.js         剧团共享道具：登记册与总量调整、时段预约（单条/批量，半开区间库存扫描线）、
                    容量冲突（道具/冲突时段/缺口）、调期集成校验、演员可见性
+  substitutes.js   单时段临时替角：设置/替换/撤回（签到开启前）、最终参与者返回、替角本场台词；
+                   失效与重校验由 schedules.js/rehearsals.js 在调期/改派/换版/取消事务内完成
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试

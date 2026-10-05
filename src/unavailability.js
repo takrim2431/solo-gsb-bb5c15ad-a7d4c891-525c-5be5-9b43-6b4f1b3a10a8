@@ -66,7 +66,9 @@ function actorActiveSchedules(actorId) {
     )
     .all();
   return rows.filter((s) =>
-    participantDetails(s.rehearsal_id, s.version_id, s.scene_id).participants.some((p) => p.actorId === actorId)
+    participantDetails(s.rehearsal_id, s.version_id, s.scene_id, { scheduleId: s.id }).participants.some(
+      (p) => p.actorId === actorId
+    )
   );
 }
 

@@ -279,6 +279,34 @@ CREATE TABLE IF NOT EXISTS confirmations (
   UNIQUE (rehearsal_id, role_id, scene_id, actor_id)
 );
 
+-- 单个时段的临时替角（导演在签到开启前临时替换某角色的到场演员）：
+--   * 仅对“该排练 × 该时段 × 该角色”生效：改变该时段最终参与者、通知接收人与替角可见的本场台词；
+--     不改变常驻派角 rehearsal_cast 与逐场确认 confirmations，临时台词权限不扩展到其他场次/时段。
+--   * 同一角色同一时段至多一个生效替角（部分唯一索引）；替换/撤回采用“旧行失效 + 新行”方式留历史。
+--   * status: active=生效中；invalidated=已失效（撤回、改派/撤派、角色失去台词、时段取消/待调整等）。
+--   * 失效后不再占用演员；取消/待调整期间不占用，恢复有效后须重新设置并重新校验。
+--   * 已开启签到的时段冻结名单，不再允许设置/撤回（路由层拒绝，本表不回写签到快照）。
+CREATE TABLE IF NOT EXISTS schedule_substitutes (
+  id                 INTEGER PRIMARY KEY,
+  schedule_id        INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id       INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  role_id            INTEGER NOT NULL REFERENCES roles(id),
+  original_actor_id  INTEGER NOT NULL REFERENCES users(id),
+  substitute_actor_id INTEGER NOT NULL REFERENCES users(id),
+  reason             TEXT NOT NULL DEFAULT '',
+  status             TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active', 'invalidated')),
+  created_by         INTEGER REFERENCES users(id),
+  created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  invalidated_reason TEXT NOT NULL DEFAULT '', -- withdrawn / cast_changed / cast_unassigned / role_no_lines / schedule_cancelled / schedule_pending_adjustment
+  invalidated_at     TEXT
+);
+-- 同一角色同一时段只保留一个生效替角（失效行保留为历史，不受唯一约束）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_substitutes_one_active
+  ON schedule_substitutes(schedule_id, role_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_substitutes_rehearsal ON schedule_substitutes(rehearsal_id);
+CREATE INDEX IF NOT EXISTS idx_substitutes_actor ON schedule_substitutes(substitute_actor_id);
+
 -- 时段通知批次：导演调整排练安排后，演员需确认知悉当前时段。
 --   * 有效时段创建、起止/场次变化，以及派角/撤派/显式换版使该时段参与演员、角色或
 --     固定版本变化时，按最终结果生成新批次；无实质变化（fingerprint 相同）不重复生成。
@@ -298,7 +326,7 @@ CREATE TABLE IF NOT EXISTS schedule_notifications (
   fingerprint   TEXT NOT NULL,                   -- 实质内容指纹（时段/场次/版本/参与演员及角色）
   status        TEXT NOT NULL DEFAULT 'current'
                   CHECK (status IN ('current', 'superseded', 'inactive')),
-  reason        TEXT NOT NULL DEFAULT '',        -- create / adjust / batch_adjust / cast / batch_cast / version_switch
+  reason        TEXT NOT NULL DEFAULT '',        -- create / adjust / batch_adjust / cast / batch_cast / version_switch / substitute
   created_by    INTEGER REFERENCES users(id),
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (schedule_id, seq)

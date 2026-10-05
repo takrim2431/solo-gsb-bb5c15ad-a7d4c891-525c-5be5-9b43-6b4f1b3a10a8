@@ -22,6 +22,13 @@ const { assertPropsAfterScheduleChange } = require('./props');
  * 本模块不引用 rehearsals.js（避免循环依赖），rehearsals.js 在派角/换版事务中
  * 调用这里导出的 assertRehearsalSchedulesAfterCastChange / applySchedulesAfterVersionSwitch /
  * syncScheduleNotifications（时段通知批次生成，查询与演员确认见 notifications.js）。
+ *
+ * 临时替角（schedule_substitutes，路由见 substitutes.js）：
+ *   - participantDetails(..., {scheduleId}) 套用该时段生效替角计算最终参与者；
+ *     冲突检测、通知批次、日程序列化均自动按替角后名单运作。
+ *   - 失效/重校验工具（invalidateSubstitutes / revalidateSubstitutesForSchedule /
+ *     revalidateSubstitutesAfterVersionSwitch）在调期/取消（本模块）与派角/换版（rehearsals.js）
+ *     的事务内调用；替角设置/撤回路由本身不与这些流程交叉。
  */
 
 const router = express.Router();
@@ -56,8 +63,13 @@ function parseTzDateTime(value, field) {
 /**
  * 时段参与者与待补派：
  * 该排练当前固定版本中本场有台词的角色里，已派角的演员为参与者，未派角的角色为待补派。
+ * opts.scheduleId 给出具体时段时，套用该时段“生效中的临时替角”：
+ *   被替角色计入替补演员（roles 中标 temporary=true 并带 originalActorId），原演员不占该角色；
+ *   一人在同一时段同时以常驻/替角身份承担多角时合并为一个参与者。
+ *   仅影响本时段的参与者计算，不改常驻派角；替角权限不外延到其他时段/场次。
  */
-function participantDetails(rehearsalId, versionId, sceneId) {
+function participantDetails(rehearsalId, versionId, sceneId, opts = {}) {
+  const scheduleId = opts.scheduleId ?? null;
   const roleIds = db
     .prepare('SELECT DISTINCT role_id FROM version_lines WHERE version_id = ? AND scene_id = ? ORDER BY role_id')
     .all(versionId, sceneId)
@@ -71,21 +83,49 @@ function participantDetails(rehearsalId, versionId, sceneId) {
     )
     .all(rehearsalId);
   const castMap = new Map(cast.map((c) => [c.role_id, c]));
+  // 生效替角（仅在明确给出 scheduleId 时套用；失效行不参与）
+  const subMap = new Map();
+  if (scheduleId != null) {
+    const subs = db
+      .prepare("SELECT * FROM schedule_substitutes WHERE schedule_id = ? AND status = 'active'")
+      .all(scheduleId);
+    for (const sub of subs) subMap.set(sub.role_id, sub);
+  }
+  const userCache = new Map();
+  const userOf = (id) => {
+    if (!userCache.has(id)) {
+      userCache.set(id, db.prepare('SELECT id, display_name, username FROM users WHERE id = ?').get(id));
+    }
+    return userCache.get(id);
+  };
   const participants = new Map(); // actorId -> { ... , roles: [] }（一人多角时合并）
   const pendingCast = [];
   for (const roleId of roleIds) {
     const role = db.prepare('SELECT * FROM roles WHERE id = ?').get(roleId);
     const c = castMap.get(roleId);
-    if (c) {
-      if (!participants.has(c.actor_id)) {
-        participants.set(c.actor_id, {
-          actorId: c.actor_id,
-          actorName: c.display_name,
-          actorUsername: c.username,
+    const sub = subMap.get(roleId);
+    // 替角生效的一致性条件：原派角仍指向记录中的原演员，且替补确为另一人；
+    // 任一不满足（理论上已被失效流程清掉）按无替角处理，防止错误占角。
+    const useSub = !!(sub && c && sub.original_actor_id === c.actor_id && sub.substitute_actor_id !== c.actor_id);
+    const actorId = useSub ? sub.substitute_actor_id : c?.actor_id;
+    if (c && actorId) {
+      if (!participants.has(actorId)) {
+        const u = userOf(actorId);
+        participants.set(actorId, {
+          actorId,
+          actorName: u?.display_name ?? `#${actorId}`,
+          actorUsername: u?.username ?? null,
           roles: [],
         });
       }
-      participants.get(c.actor_id).roles.push({ roleId, roleCode: role?.code ?? null, roleName: role?.name ?? null });
+      participants.get(actorId).roles.push({
+        roleId,
+        roleCode: role?.code ?? null,
+        roleName: role?.name ?? null,
+        temporary: useSub,
+        originalActorId: useSub ? c.actor_id : null,
+        originalActorName: useSub ? c.display_name ?? null : null,
+      });
     } else {
       pendingCast.push({ roleId, roleCode: role?.code ?? null, roleName: role?.name ?? null });
     }
@@ -98,7 +138,10 @@ const overlaps = (aStart, aEnd, bStart, bEnd) => aStart < bEnd && bStart < aEnd;
 
 /** 构造待检时段（候选）：新建/调整/派角/换版时统一用前瞻数据参与冲突检测 */
 function buildCandidate({ scheduleId = null, rehearsal, sceneId, startAt, endAt, versionId }) {
-  const { participants } = participantDetails(rehearsal.id, versionId ?? rehearsal.version_id, sceneId);
+  // 给出 scheduleId 时套用该时段生效替角后的“最终参与者”（临时替角只占本时段）
+  const { participants } = participantDetails(rehearsal.id, versionId ?? rehearsal.version_id, sceneId, {
+    scheduleId,
+  });
   return {
     scheduleId,
     rehearsalId: rehearsal.id,
@@ -177,7 +220,9 @@ function findScheduleConflicts(candidates) {
   const partCache = new Map();
   const actorsOf = (row) => {
     if (!partCache.has(row.id)) {
-      const { participants } = participantDetails(row.rehearsal_id, row.version_id, row.scene_id);
+      const { participants } = participantDetails(row.rehearsal_id, row.version_id, row.scene_id, {
+        scheduleId: row.id,
+      });
       partCache.set(row.id, new Set(participants.map((p) => p.actorId)));
     }
     return partCache.get(row.id);
@@ -299,21 +344,175 @@ function planSchedulesForVersionSwitch(rehearsalId, newVersionId) {
  * 返回被标为待调整的时段 id 列表。
  */
 function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
-  const { needsAdjustment, candidates } = planSchedulesForVersionSwitch(rehearsalId, newVersionId);
+  const { needsAdjustment, stillActive, candidates: staleCandidates } = planSchedulesForVersionSwitch(
+    rehearsalId,
+    newVersionId
+  );
+  void staleCandidates;
   for (const s of needsAdjustment) {
     db.prepare("UPDATE rehearsal_schedules SET status = 'needs_adjustment' WHERE id = ?").run(s.id);
   }
+  // 先按最终名单重校验替角：整场无台词（转待调整）/角色失去台词/原派角变化的替角失效，不再占用演员
+  const subResult = revalidateSubstitutesAfterVersionSwitch(
+    rehearsalId,
+    newVersionId,
+    needsAdjustment.map((s) => s.id)
+  );
+  // 再用失效后的最终参与者构造候选并统一检测冲突
+  const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(rehearsalId);
+  const candidates = stillActive.map((s) =>
+    buildCandidate({
+      scheduleId: s.id,
+      rehearsal,
+      sceneId: s.scene_id,
+      startAt: s.start_at,
+      endAt: s.end_at,
+      versionId: newVersionId,
+    })
+  );
   assertNoScheduleConflicts(candidates, '换版后参与演员与其他未取消时段重叠，本次换版未生效');
   assertNoUnavailabilityConflicts(candidates, '换版后参与演员与其登记的不可用时段相撞，本次换版未生效');
-  return needsAdjustment.map((s) => s.id);
+  return { needsAdjustmentIds: needsAdjustment.map((s) => s.id), substitutesInvalidated: subResult };
+}
+
+// ---- 临时替角（schedule_substitutes）：失效/重校验，供本模块调期、撤档及 rehearsals.js 派角/换版调用 ----
+
+/**
+ * 将指定替角标记为失效（保留历史行；幂等：只动当前生效行）。
+ * filters：{ scheduleId?, rehearsalId?, roleId? } 至少给一个；reason 写入 invalidated_reason。
+ * 返回被新标记失效的行 id 列表。
+ */
+function invalidateSubstitutes(filters = {}, reason) {
+  const where = ["status = 'active'"];
+  const args = [];
+  if (filters.scheduleId != null) {
+    where.push('schedule_id = ?');
+    args.push(filters.scheduleId);
+  }
+  if (filters.rehearsalId != null) {
+    where.push('rehearsal_id = ?');
+    args.push(filters.rehearsalId);
+  }
+  if (filters.roleId != null) {
+    where.push('role_id = ?');
+    args.push(filters.roleId);
+  }
+  const rows = db
+    .prepare(`SELECT id FROM schedule_substitutes WHERE ${where.join(' AND ')}`)
+    .all(...args);
+  const ids = rows.map((r) => r.id);
+  if (ids.length) {
+    const ph = ids.map(() => '?').join(',');
+    db
+      .prepare(
+        `UPDATE schedule_substitutes
+            SET status = 'invalidated', invalidated_reason = ?, invalidated_at = datetime('now')
+          WHERE id IN (${ph})`
+      )
+      .run(reason ?? '', ...ids);
+  }
+  return ids;
+}
+
+/**
+ * 按“最终名单”重新校验指定时段的全部生效替角（调期/批量调期后调用）：
+ *   - 角色在当前固定版本目标场次仍有台词、且常驻派角仍为记录中的原演员 -> 保留；
+ *   - 角色在目标场次已无台词（调场次）-> 以 role_no_lines 失效；
+ *   - 原派角已变化（理论上派角流程已处理）-> 以 cast_changed 失效。
+ * 仅做“有效性”重校验；时段冲突/不可用冲突由调用方按重算后的最终参与者统一 409。
+ */
+function revalidateSubstitutesForSchedule(scheduleId, rehearsal, sceneId) {
+  const subs = db
+    .prepare("SELECT * FROM schedule_substitutes WHERE schedule_id = ? AND status = 'active'")
+    .all(scheduleId);
+  const invalidated = [];
+  for (const sub of subs) {
+    const hasLines = db
+      .prepare('SELECT 1 FROM version_lines WHERE version_id = ? AND role_id = ? AND scene_id = ? LIMIT 1')
+      .get(rehearsal.version_id, sub.role_id, sceneId);
+    if (!hasLines) {
+      invalidateSubstitutes({ scheduleId, roleId: sub.role_id }, 'role_no_lines');
+      invalidated.push(sub.id);
+      continue;
+    }
+    const castRow = db
+      .prepare('SELECT actor_id FROM rehearsal_cast WHERE rehearsal_id = ? AND role_id = ?')
+      .get(rehearsal.id, sub.role_id);
+    if (!castRow) {
+      invalidateSubstitutes({ scheduleId, roleId: sub.role_id }, 'cast_unassigned');
+      invalidated.push(sub.id);
+    } else if (castRow.actor_id !== sub.original_actor_id) {
+      invalidateSubstitutes({ scheduleId, roleId: sub.role_id }, 'cast_changed');
+      invalidated.push(sub.id);
+    }
+  }
+  return invalidated;
+}
+
+/**
+ * 换版后按新版本重校验某排练所有有效时段的生效替角：
+ *   - 时段整场在新版本中无台词（转待调整）-> 替角随 schedule_pending_adjustment 失效；
+ *   - 仍有效时段中，角色在该场次已无台词 -> role_no_lines；原派角变化 -> cast_changed。
+ * 返回 { invalidated: [替角id], bySchedule: Map<scheduleId, [替角id]> }，供预演/通知展示。
+ */
+function revalidateSubstitutesAfterVersionSwitch(rehearsalId, newVersionId, needsAdjustmentScheduleIds) {
+  const pendingSet = new Set(needsAdjustmentScheduleIds);
+  // 在 applySchedulesAfterVersionSwitch 之后调用：转待调整的时段状态已翻转，故此处不过滤 status
+  const rows = db
+    .prepare(
+      `SELECT ss.*, s.scene_id AS schedule_scene_id, s.status AS schedule_status
+         FROM schedule_substitutes ss
+         JOIN rehearsal_schedules s ON s.id = ss.schedule_id
+        WHERE ss.rehearsal_id = ? AND ss.status = 'active' AND s.status <> 'cancelled'`
+    )
+    .all(rehearsalId);
+  const invalidated = [];
+  const bySchedule = new Map();
+  for (const sub of rows) {
+    let reason = null;
+    if (pendingSet.has(sub.schedule_id)) {
+      reason = 'schedule_pending_adjustment';
+    } else {
+      const hasLines = db
+        .prepare('SELECT 1 FROM version_lines WHERE version_id = ? AND role_id = ? AND scene_id = ? LIMIT 1')
+        .get(newVersionId, sub.role_id, sub.schedule_scene_id);
+      if (!hasLines) {
+        reason = 'role_no_lines';
+      } else {
+        const castRow = db
+          .prepare('SELECT actor_id FROM rehearsal_cast WHERE rehearsal_id = ? AND role_id = ?')
+          .get(rehearsalId, sub.role_id);
+        if (!castRow) reason = 'cast_unassigned';
+        else if (castRow.actor_id !== sub.original_actor_id) reason = 'cast_changed';
+      }
+    }
+    if (!reason) continue;
+    db.prepare(
+      `UPDATE schedule_substitutes
+          SET status = 'invalidated', invalidated_reason = ?, invalidated_at = datetime('now')
+        WHERE id = ?`
+    ).run(reason, sub.id);
+    invalidated.push(sub.id);
+    if (!bySchedule.has(sub.schedule_id)) bySchedule.set(sub.schedule_id, []);
+    bySchedule.get(sub.schedule_id).push(sub.id);
+  }
+  return { invalidated, bySchedule };
 }
 
 // ---- 时段通知批次（知悉确认）：生成逻辑；查询与演员确认见 notifications.js ----
 
-/** 批次实质内容指纹：UTC 起止、场次、固定版本、参与演员及其角色（与展示顺序无关） */
+/**
+ * 批次实质内容指纹：UTC 起止、场次、固定版本、参与演员及其角色。
+ * 角色同时记录是否为临时替角——同一演员同一角色在常驻派角与临时替角间切换时，
+ * 通知接收人的角色语义（临时台词权限仅本时段）变化，也应重发批次。
+ */
 function notificationFingerprint({ sceneId, versionId, startAt, endAt, participants }) {
   const p = participants
-    .map((x) => ({ actorId: x.actorId, roleIds: x.roles.map((r) => r.roleId).sort((a, b) => a - b) }))
+    .map((x) => ({
+      actorId: x.actorId,
+      roleIds: x.roles.map((r) => r.roleId).sort((a, b) => a - b),
+      tempRoleIds: x.roles.filter((r) => r.temporary).map((r) => r.roleId).sort((a, b) => a - b),
+    }))
     .sort((a, b) => a.actorId - b.actorId);
   return JSON.stringify({ sceneId, versionId, startAt, endAt, participants: p });
 }
@@ -343,7 +542,9 @@ function syncScheduleNotifications(rehearsalId, reason, actorId = null) {
       }
       continue;
     }
-    const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
+    const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id, {
+      scheduleId: s.id,
+    });
     const fingerprint = notificationFingerprint({
       sceneId: s.scene_id,
       versionId: rehearsal.version_id,
@@ -403,9 +604,71 @@ function propReservationsBrief(scheduleId) {
     .map((r) => ({ propId: r.prop_id, propName: r.prop_name, quantity: r.quantity }));
 }
 
+/** 导演视图：该时段的临时替角（含已失效历史，最新在前） */
+function substitutesForSchedule(scheduleId) {
+  return db
+    .prepare(
+      `SELECT ss.*,
+              ro.code AS role_code, ro.name AS role_name,
+              ua.display_name AS original_name, ua.username AS original_username,
+              sa.display_name AS substitute_name, sa.username AS substitute_username
+         FROM schedule_substitutes ss
+         JOIN roles ro ON ro.id = ss.role_id
+         JOIN users ua ON ua.id = ss.original_actor_id
+         JOIN users sa ON sa.id = ss.substitute_actor_id
+        WHERE ss.schedule_id = ?
+        ORDER BY ss.id DESC`
+    )
+    .all(scheduleId)
+    .map(serializeSubstituteRow);
+}
+
+/** 仅该时段当前生效的替角（列表摘要用） */
+function activeSubstitutesForSchedule(scheduleId) {
+  return db
+    .prepare(
+      `SELECT ss.*,
+              ro.code AS role_code, ro.name AS role_name,
+              ua.display_name AS original_name, ua.username AS original_username,
+              sa.display_name AS substitute_name, sa.username AS substitute_username
+         FROM schedule_substitutes ss
+         JOIN roles ro ON ro.id = ss.role_id
+         JOIN users ua ON ua.id = ss.original_actor_id
+         JOIN users sa ON sa.id = ss.substitute_actor_id
+        WHERE ss.schedule_id = ? AND ss.status = 'active'
+        ORDER BY ss.role_id`
+    )
+    .all(scheduleId)
+    .map(serializeSubstituteRow);
+}
+
+function serializeSubstituteRow(r) {
+  return {
+    id: r.id,
+    scheduleId: r.schedule_id,
+    rehearsalId: r.rehearsal_id,
+    roleId: r.role_id,
+    roleCode: r.role_code,
+    roleName: r.role_name,
+    originalActorId: r.original_actor_id,
+    originalActorName: r.original_name,
+    originalActorUsername: r.original_username,
+    substituteActorId: r.substitute_actor_id,
+    substituteActorName: r.substitute_name,
+    substituteActorUsername: r.substitute_username,
+    reason: r.reason,
+    status: r.status,
+    invalidatedReason: r.invalidated_reason || null,
+    createdAt: r.created_at,
+    invalidatedAt: r.invalidated_at,
+  };
+}
+
 /** 导演视图：含参与者与待补派；attendance 为到场登记摘要、notification 为时段通知摘要（无则为 null） */
 function serializeSchedule(s, rehearsal) {
-  const { participants, pendingCast } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
+  const { participants, pendingCast } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id, {
+    scheduleId: s.id,
+  });
   return {
     id: s.id,
     rehearsalId: s.rehearsal_id,
@@ -416,6 +679,7 @@ function serializeSchedule(s, rehearsal) {
     status: s.status,
     participants,
     pendingCast,
+    substitutes: activeSubstitutesForSchedule(s.id),
     props: propReservationsBrief(s.id),
     attendance: attendanceSummary(s.id),
     notification: notificationSummary(s.id),
@@ -443,9 +707,11 @@ function attendanceSummary(scheduleId) {
   };
 }
 
-/** 演员视图：只看自己当前参与的有效时段；attendance 为本人登记状态、notification 为本人通知状态（不在名单/无批次为 null） */
+/** 演员视图：只看自己当前参与的有效时段（含仅以替角身份参与）；attendance 为本人登记状态、notification 为本人通知状态（不在名单/无批次为 null） */
 function serializeScheduleForActor(s, rehearsal, actorId) {
-  const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
+  const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id, {
+    scheduleId: s.id,
+  });
   const me = participants.find((p) => p.actorId === actorId);
   return {
     id: s.id,
@@ -577,13 +843,24 @@ router.get(
       }
       return res.json({ schedules: rows.map((s) => serializeSchedule(s, r)) });
     }
+    // 演员须被派角，或在该排练某有效时段被设为临时替角，方可查看时段列表
     const myRoles = assignedRoleIds(r.id, req.user.id);
-    if (myRoles.length === 0) throw forbidden('你没有被分配到该排练的任何角色');
+    const mySub = db
+      .prepare(
+        `SELECT 1 FROM schedule_substitutes ss
+           JOIN rehearsal_schedules s ON s.id = ss.schedule_id
+          WHERE ss.rehearsal_id = ? AND ss.substitute_actor_id = ?
+            AND ss.status = 'active' AND s.status = 'active' LIMIT 1`
+      )
+      .get(r.id, req.user.id);
+    if (myRoles.length === 0 && !mySub) throw forbidden('你没有被分配到该排练的任何角色');
     const rows = db
       .prepare("SELECT * FROM rehearsal_schedules WHERE rehearsal_id = ? AND status = 'active' ORDER BY start_at, id")
       .all(r.id);
     const mine = rows.filter((s) =>
-      participantDetails(r.id, r.version_id, s.scene_id).participants.some((p) => p.actorId === req.user.id)
+      participantDetails(r.id, r.version_id, s.scene_id, { scheduleId: s.id }).participants.some(
+        (p) => p.actorId === req.user.id
+      )
     );
     res.json({ schedules: mine.map((s) => serializeScheduleForActor(s, r, req.user.id)) });
   })
@@ -602,7 +879,10 @@ router.patch(
       db.prepare(
         "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
       ).run(sceneId, startAt, endAt, s.id);
-      // 调整后的参与演员与其他未取消时段重叠 -> 整次拒绝（事务回滚）；撞上不可用时段同样整次拒绝
+      // 调期/改场次后按最终名单重校验该时段替角：角色失去台词或原派角变化 -> 替角失效；
+      // 取消/待调整期间不占用演员（无效时段）；恢复有效后须由导演重新设置替角。
+      revalidateSubstitutesForSchedule(s.id, r, sceneId);
+      // 调整后的最终参与者（含仍生效替角）与其他未取消时段重叠 -> 整次拒绝（事务回滚）；撞上不可用时段同样整次拒绝
       const cand = buildCandidate({ scheduleId: s.id, rehearsal: r, sceneId, startAt, endAt });
       assertNoScheduleConflicts([cand]);
       assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次调整未生效');
@@ -667,6 +947,8 @@ router.post(
         db.prepare(
           "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
         ).run(x.sceneId, x.startAt, x.endAt, x.scheduleId);
+        // 按最终名单重校验替角（目标场次失去台词/原派角变化的替角失效；失效后不再占用演员）
+        revalidateSubstitutesForSchedule(x.scheduleId, r, x.sceneId);
       }
       // 以整批最终状态构造候选：批内两两（如两条互换时间）+ 与库中其他有效时段（本批 ids 跳过）统一检测
       const candidates = parsed.map((x) =>
@@ -725,6 +1007,8 @@ router.post(
       } else if (att && att.status === 'closed') {
         db.prepare('UPDATE attendance_sessions SET schedule_cancelled = 1 WHERE id = ?').run(att.id);
       }
+      // 取消时段：生效替角随之失效（取消期间不占用演员）；历史行保留
+      invalidateSubstitutes({ scheduleId: s.id }, 'schedule_cancelled');
       // 时段取消：当前通知批次不再待确认（批次保留为历史）
       syncScheduleNotifications(r.id, 'cancel', req.user.id);
     });
@@ -741,6 +1025,13 @@ module.exports = {
   findUnavailabilityConflicts,
   syncScheduleNotifications,
   participantDetails,
+  buildCandidate,
   parseTzDateTime,
   slotRef,
+  invalidateSubstitutes,
+  revalidateSubstitutesForSchedule,
+  revalidateSubstitutesAfterVersionSwitch,
+  activeSubstitutesForSchedule,
+  substitutesForSchedule,
+  serializeSubstituteRow,
 };

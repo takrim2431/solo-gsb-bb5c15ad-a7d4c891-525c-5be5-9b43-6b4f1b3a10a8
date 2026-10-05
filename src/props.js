@@ -61,14 +61,16 @@ function scheduleBrief(s) {
 
 /**
  * 某演员当前是否为某时段的参与者（动态口径与 schedules.js 一致：
- * 排练当前固定版本中本场有台词且已派角）。本模块自包含实现，避免与 schedules.js 循环依赖。
+ * 排练当前固定版本中本场有台词且已派角，或在该时段被设为生效临时替角）。
+ * 本模块自包含实现，避免与 schedules.js 循环依赖。
  */
 function isScheduleParticipant(scheduleId, actorId) {
   const s = db.prepare('SELECT * FROM rehearsal_schedules WHERE id = ?').get(scheduleId);
   if (!s || s.status !== 'active') return false;
   const r = db.prepare('SELECT version_id FROM rehearsals WHERE id = ?').get(s.rehearsal_id);
+  if (!r) return false;
+  // 常驻派角，或该时段生效替角（且角色在当前版本本场仍有台词）
   return !!(
-    r &&
     db
       .prepare(
         `SELECT 1
@@ -77,7 +79,17 @@ function isScheduleParticipant(scheduleId, actorId) {
           WHERE vl.version_id = ? AND vl.scene_id = ? AND c.actor_id = ?
           LIMIT 1`
       )
-      .get(s.rehearsal_id, r.version_id, s.scene_id, actorId)
+      .get(s.rehearsal_id, r.version_id, s.scene_id, actorId) ||
+    db
+      .prepare(
+        `SELECT 1
+           FROM schedule_substitutes ss
+           JOIN version_lines vl ON vl.role_id = ss.role_id
+          WHERE ss.schedule_id = ? AND ss.status = 'active' AND ss.substitute_actor_id = ?
+            AND vl.version_id = ? AND vl.scene_id = ?
+          LIMIT 1`
+      )
+      .get(scheduleId, actorId, r.version_id, s.scene_id)
   );
 }
 
