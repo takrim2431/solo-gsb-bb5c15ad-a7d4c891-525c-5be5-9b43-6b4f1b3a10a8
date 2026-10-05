@@ -60,25 +60,40 @@ function scheduleBrief(s) {
 }
 
 /**
- * 某演员当前是否为某时段的参与者（动态口径与 schedules.js 一致：
- * 排练当前固定版本中本场有台词且已派角）。本模块自包含实现，避免与 schedules.js 循环依赖。
+ * 某演员当前是否为某时段的最终参与者（动态口径与 schedules.js 一致：
+ * 排练当前固定版本中本场有台词且已派角，或该演员在此时段担任生效中的临时替角）。
+ * 本模块自包含实现，避免与 schedules.js 循环依赖。
  */
 function isScheduleParticipant(scheduleId, actorId) {
   const s = db.prepare('SELECT * FROM rehearsal_schedules WHERE id = ?').get(scheduleId);
   if (!s || s.status !== 'active') return false;
   const r = db.prepare('SELECT version_id FROM rehearsals WHERE id = ?').get(s.rehearsal_id);
-  return !!(
-    r &&
-    db
-      .prepare(
-        `SELECT 1
-           FROM version_lines vl
-           JOIN rehearsal_cast c ON c.role_id = vl.role_id AND c.rehearsal_id = ?
-          WHERE vl.version_id = ? AND vl.scene_id = ? AND c.actor_id = ?
-          LIMIT 1`
-      )
-      .get(s.rehearsal_id, r.version_id, s.scene_id, actorId)
-  );
+  if (!r) return false;
+  // 该场次中被生效替角顶替的角色：常驻演员不再是最终参与者
+  const substitutedRoleRows = db
+    .prepare('SELECT role_id FROM schedule_role_substitutes WHERE schedule_id = ? AND status = \'active\'')
+    .all(scheduleId);
+  const excludedRoleIds = substitutedRoleRows.map((x) => x.role_id);
+  const placeholders = excludedRoleIds.length ? excludedRoleIds.map(() => '?').join(',') : null;
+  const castHit = db
+    .prepare(
+      `SELECT 1
+         FROM version_lines vl
+         JOIN rehearsal_cast c ON c.role_id = vl.role_id AND c.rehearsal_id = ?
+        WHERE vl.version_id = ? AND vl.scene_id = ? AND c.actor_id = ?
+        ${placeholders ? `AND vl.role_id NOT IN (${placeholders})` : ''}
+        LIMIT 1`
+    )
+    .get(s.rehearsal_id, r.version_id, s.scene_id, actorId, ...(placeholders ? excludedRoleIds : []));
+  if (castHit) return true;
+  // 临时替角：该时段内顶替某角色的替补演员也算最终参与者
+  const subHit = db
+    .prepare(
+      `SELECT 1 FROM schedule_role_substitutes
+        WHERE schedule_id = ? AND actor_id = ? AND status = 'active' LIMIT 1`
+    )
+    .get(scheduleId, actorId);
+  return !!subHit;
 }
 
 // ---- 库存容量校验（半开区间扫描线；端点相接可复用） ----

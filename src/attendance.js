@@ -170,7 +170,10 @@ router.post(
 
     const sessionId = transaction(() => {
       // 冻结：场次、UTC 时段、当时固定版本、当时“有台词且已派角”的演员名单与缺口
-      const { participants, pendingCast } = participantDetails(r.id, r.version_id, s.scene_id);
+      // （含该时段已设置的临时替角——替角只存在于签到开启前；开启后名单不再回写）
+      const { participants, pendingCast } = participantDetails(r.id, r.version_id, s.scene_id, {
+        scheduleId: s.id,
+      });
       const id = db
         .prepare(
           `INSERT INTO attendance_sessions

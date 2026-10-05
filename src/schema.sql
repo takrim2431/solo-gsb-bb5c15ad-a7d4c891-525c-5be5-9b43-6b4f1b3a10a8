@@ -318,6 +318,38 @@ CREATE TABLE IF NOT EXISTS schedule_notification_recipients (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_recipients_actor ON schedule_notification_recipients(actor_id);
 
+-- 单时段临时替角：导演在签到开启前，为某“有效”时段的某个“本场有台词且已派角”的角色
+-- 指定一名不同于原演员的替补演员，仅改变该时段的最终参与者/通知接收人/该场可见台词，
+-- 不改变常驻派角（rehearsal_cast）与逐场确认（confirmations）。
+--   * 同一时段同一角色至多一个生效中替补（部分唯一索引强制）；重新设置时旧行置为 invalidated（replaced）。
+--   * original_actor_id 为设置时的常驻派角演员；派角改派/撤派、换版/改场次致角色失去台词、
+--     时段取消/转待调整时，替补自动失效（invalidated + invalidated_reason 留痕），须重新设置与校验。
+--   * 待调整/已取消时段不占用演员（不计入冲突检测）；时段恢复有效后须重新设置替补。
+--   * 已开启签到的时段名单冻结，不允许再设置/撤回（ATTENDANCE_FROZEN）。
+--   invalidated_reason: replaced / withdrawn / cast_reassigned / cast_unassigned /
+--     role_lines_removed / schedule_cancelled / schedule_needs_adjustment
+CREATE TABLE IF NOT EXISTS schedule_role_substitutes (
+  id                 INTEGER PRIMARY KEY,
+  schedule_id        INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id       INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  role_id            INTEGER NOT NULL REFERENCES roles(id),
+  original_actor_id  INTEGER NOT NULL REFERENCES users(id),
+  actor_id           INTEGER NOT NULL REFERENCES users(id),
+  reason             TEXT NOT NULL DEFAULT '',
+  status             TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active', 'invalidated')),
+  invalidated_reason TEXT,
+  created_by         INTEGER REFERENCES users(id),
+  created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  invalidated_at     TEXT,
+  CHECK (actor_id <> original_actor_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_substitutes_active
+  ON schedule_role_substitutes(schedule_id, role_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_substitutes_schedule ON schedule_role_substitutes(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_substitutes_rehearsal ON schedule_role_substitutes(rehearsal_id);
+CREATE INDEX IF NOT EXISTS idx_substitutes_actor ON schedule_role_substitutes(actor_id);
+
 -- 剧团共享道具：导演登记各道具的非负整数总件数（库存），按排练时段预约。
 --   * 仅“有效（active）”时段的预约占用库存；已取消（cancelled）与待调整（needs_adjustment）
 --     时段的预约随记录保留但不占用——取消/换版转待调整时释放，待调整恢复有效时重新校验。

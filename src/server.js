@@ -11,6 +11,7 @@ const { router: schedulesRouter } = require('./schedules');
 const { router: attendanceRouter } = require('./attendance');
 const { router: unavailabilityRouter } = require('./unavailability');
 const { router: notificationsRouter } = require('./notifications');
+const { router: substitutesRouter } = require('./substitutes');
 const { router: propsRouter } = require('./props');
 const { db } = require('./db');
 
@@ -43,6 +44,7 @@ app.use('/api', schedulesRouter);
 app.use('/api', attendanceRouter);
 app.use('/api', unavailabilityRouter);
 app.use('/api', notificationsRouter);
+app.use('/api', substitutesRouter);
 app.use('/api', propsRouter);
 
 // 演员名册（仅导演）
