@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>剧团排练台词</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">🎭 剧团排练台词</div>
+    <div id="userbox" class="hidden">
+      <span id="userinfo"></span>
+      <button id="logoutBtn" class="btn small">退出</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <!-- 登录 -->
+    <section id="loginView" class="card narrow">
+      <h1>登录</h1>
+      <form id="loginForm">
+        <label>用户名 <input name="username" required autocomplete="username" /></label>
+        <label>密码 <input name="password" type="password" required autocomplete="current-password" /></label>
+        <button class="btn primary" type="submit">登录</button>
+      </form>
+      <p class="hint">
+        演示账号：导演 <code>director / director123</code>；演员 <code>lin / actor123</code>、
+        <code>chen / actor123</code>
+      </p>
+    </section>
+
+    <!-- 导演视图 -->
+    <section id="directorView" class="hidden">
+      <div class="tabs">
+        <button class="tab active" data-tab="plays">剧本与版本</button>
+        <button class="tab" data-tab="revisions">修订发布</button>
+        <button class="tab" data-tab="rehearsals">排练与确认</button>
+        <button class="tab" data-tab="props">共享道具</button>
+        <button class="tab" data-tab="dashboard">总览</button>
+      </div>
+
+      <div id="tab-plays" class="tabpanel"></div>
+      <div id="tab-revisions" class="tabpanel hidden"></div>
+      <div id="tab-rehearsals" class="tabpanel hidden"></div>
+      <div id="tab-props" class="tabpanel hidden"></div>
+      <div id="tab-dashboard" class="tabpanel hidden"></div>
+    </section>
+
+    <!-- 演员视图 -->
+    <section id="actorView" class="hidden"></section>
+  </main>
+
+  <div id="toast" class="hidden"></div>
+  <script src="/app.js"></script>
+  <script src="/views-plays.js"></script>
+  <script src="/views-revisions.js"></script>
+  <script src="/views-rehearsals.js"></script>
+  <script src="/views-props.js"></script>
+</body>
+</html>

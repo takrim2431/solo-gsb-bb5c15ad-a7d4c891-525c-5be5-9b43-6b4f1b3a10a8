@@ -1,0 +1,18 @@
+{
+  "name": "rehearsal-lines",
+  "version": "1.0.0",
+  "description": "剧团排练台词管理：场次/角色/顺序、修订发布与冲突、版本固定与确认",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "bash scripts/run-e2e.sh",
+    "postinstall": "node scripts/install-better-sqlite3.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2"
+  }
+}

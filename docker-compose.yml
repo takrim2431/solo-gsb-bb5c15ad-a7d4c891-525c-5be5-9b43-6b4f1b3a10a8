@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: rehearsal-lines:latest
+    container_name: rehearsal-lines
+    ports:
+      - "3000:3000"
+    environment:
+      # 监听
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      # SQLite 数据库目录（容器内），挂载到宿主机持久化
+      DATA_DIR: "/data"
+    volumes:
+      - rehearsal-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  rehearsal-data:
